@@ -1,0 +1,28 @@
+/*
+ * Copyright (c) 2024 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		nordic,nus-uart = &uart20;
+	};
+
+	aliases {
+		led0 = &led0;
+		led1 = &led1;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio2 0 GPIO_ACTIVE_HIGH>;
+			label = "LED 0";
+		};
+		led1: led_1 {
+			gpios = <&gpio2 1 GPIO_ACTIVE_HIGH>;
+			label = "LED 1";
+		};
+	};
+};

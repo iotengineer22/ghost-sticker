@@ -1,0 +1,793 @@
+/*
+ * Copyright (c) 2018 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/** @file
+ *  @brief Combined IPC LED Monitor and Nordic UART Bridge Service (NUS)
+ */
+#include <uart_async_adapter.h>
+
+#include <zephyr/types.h>
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <soc.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/hci.h>
+
+#include <bluetooth/services/nus.h>
+#include <dk_buttons_and_leds.h>
+#include <zephyr/settings/settings.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include <zephyr/logging/log.h>
+#include <zephyr/ipc/ipc_service.h>
+
+#define LOG_MODULE_NAME host
+LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+
+#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
+#define PRIORITY 7
+
+#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
+#define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
+
+#define LED2_NODE DT_ALIAS(led2)
+#define LED3_NODE DT_ALIAS(led3)
+
+static const struct gpio_dt_spec run_led = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
+static const struct gpio_dt_spec con_led = GPIO_DT_SPEC_GET(LED3_NODE, gpios);
+#define RUN_LED_BLINK_INTERVAL 1000
+
+#define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
+#define KEY_PASSKEY_REJECT DK_BTN2_MSK
+
+#define UART_BUF_SIZE CONFIG_BT_NUS_UART_BUFFER_SIZE
+#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
+#define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
+
+static K_SEM_DEFINE(ble_init_ok, 0, 1);
+
+static struct bt_conn *current_conn;
+static struct bt_conn *auth_conn;
+static struct k_work adv_work;
+
+static const struct device *uart = DEVICE_DT_GET(DT_CHOSEN(nordic_nus_uart));
+static struct k_work_delayable uart_work;
+
+struct uart_data_t {
+	void *fifo_reserved;
+	uint8_t data[UART_BUF_SIZE];
+	uint16_t len;
+};
+
+static K_FIFO_DEFINE(fifo_uart_tx_data);
+static K_FIFO_DEFINE(fifo_uart_rx_data);
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+};
+
+static const struct bt_data sd[] = {
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
+};
+
+#ifdef CONFIG_UART_ASYNC_ADAPTER
+UART_ASYNC_ADAPTER_INST_DEFINE(async_adapter);
+#else
+#define async_adapter NULL
+#endif
+
+#if defined(CONFIG_MULTITHREADING)
+K_SEM_DEFINE(bound_sem, 0, 1);
+#else
+volatile uint32_t bound_sem = 1;
+#endif
+
+static void ep_bound(void *priv)
+{
+#if defined(CONFIG_MULTITHREADING)
+	k_sem_give(&bound_sem);
+#else
+	bound_sem = 0;
+#endif
+	LOG_INF("IPC Ep bounded");
+}
+
+static void ep_recv(const void *data, size_t len, void *priv)
+{
+	LOG_INF("Received LED status from RISC-V: %s", (const char *)data);
+
+	/* Send to local UART (print on host terminal) */
+	struct uart_data_t *tx = k_malloc(sizeof(*tx));
+	if (tx) {
+		int formatted_len = snprintf(tx->data, sizeof(tx->data), "[RISC-V] %s\r\n", (const char *)data);
+		if (formatted_len > 0) {
+			tx->len = MIN((size_t)formatted_len, sizeof(tx->data) - 1);
+			if (uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS)) {
+				k_fifo_put(&fifo_uart_tx_data, tx);
+			}
+		} else {
+			k_free(tx);
+		}
+	}
+
+	/* Forward to BLE NUS if connected */
+	if (current_conn) {
+		int err = bt_nus_send(current_conn, data, strlen((const char *)data));
+		if (err) {
+			LOG_WRN("Failed to send LED status over BLE (err: %d)", err);
+		} else {
+			LOG_INF("Forwarded LED status over BLE: %s", (const char *)data);
+		}
+	}
+}
+
+static void ep_unbound(void *priv)
+{
+	LOG_INF("IPC Ep unbounded");
+}
+
+static void ep_error(const char *message, void *priv)
+{
+	LOG_ERR("ICMsg error: %s", message);
+}
+
+static struct ipc_ept_cfg ep_cfg = {
+	.cb = {
+		.bound    = ep_bound,
+		.unbound  = ep_unbound,
+		.received = ep_recv,
+		.error    = ep_error,
+	},
+};
+
+static void uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+	ARG_UNUSED(dev);
+
+	static size_t aborted_len;
+	struct uart_data_t *buf;
+	static uint8_t *aborted_buf;
+	static bool disable_req;
+
+	switch (evt->type) {
+	case UART_TX_DONE:
+		LOG_DBG("UART_TX_DONE");
+		if ((evt->data.tx.len == 0) ||
+		    (!evt->data.tx.buf)) {
+			return;
+		}
+
+		if (aborted_buf) {
+			buf = CONTAINER_OF(aborted_buf, struct uart_data_t,
+					   data[0]);
+			aborted_buf = NULL;
+			aborted_len = 0;
+		} else {
+			buf = CONTAINER_OF(evt->data.tx.buf, struct uart_data_t,
+					   data[0]);
+		}
+
+		k_free(buf);
+
+		buf = k_fifo_get(&fifo_uart_tx_data, K_NO_WAIT);
+		if (!buf) {
+			return;
+		}
+
+		if (uart_tx(uart, buf->data, buf->len, SYS_FOREVER_MS)) {
+			LOG_WRN("Failed to send data over UART");
+		}
+
+		break;
+
+	case UART_RX_RDY:
+		LOG_DBG("UART_RX_RDY");
+		buf = CONTAINER_OF(evt->data.rx.buf, struct uart_data_t, data[0]);
+		buf->len += evt->data.rx.len;
+
+		if (disable_req) {
+			return;
+		}
+
+		if ((evt->data.rx.buf[buf->len - 1] == '\n') ||
+		    (evt->data.rx.buf[buf->len - 1] == '\r')) {
+			disable_req = true;
+			uart_rx_disable(uart);
+		}
+
+		break;
+
+	case UART_RX_DISABLED:
+		LOG_DBG("UART_RX_DISABLED");
+		disable_req = false;
+
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+			k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+			return;
+		}
+
+		uart_rx_enable(uart, buf->data, sizeof(buf->data),
+			       UART_WAIT_FOR_RX);
+
+		break;
+
+	case UART_RX_BUF_REQUEST:
+		LOG_DBG("UART_RX_BUF_REQUEST");
+		buf = k_malloc(sizeof(*buf));
+		if (buf) {
+			buf->len = 0;
+			uart_rx_buf_rsp(uart, buf->data, sizeof(buf->data));
+		} else {
+			LOG_WRN("Not able to allocate UART receive buffer");
+		}
+
+		break;
+
+	case UART_RX_BUF_RELEASED:
+		LOG_DBG("UART_RX_BUF_RELEASED");
+		buf = CONTAINER_OF(evt->data.rx_buf.buf, struct uart_data_t,
+				   data[0]);
+
+		if (buf->len > 0) {
+			k_fifo_put(&fifo_uart_rx_data, buf);
+		} else {
+			k_free(buf);
+		}
+
+		break;
+
+	case UART_TX_ABORTED:
+		LOG_DBG("UART_TX_ABORTED");
+		if (!aborted_buf) {
+			aborted_buf = (uint8_t *)evt->data.tx.buf;
+		}
+
+		aborted_len += evt->data.tx.len;
+		buf = CONTAINER_OF((void *)aborted_buf, struct uart_data_t,
+				   data);
+
+		uart_tx(uart, &buf->data[aborted_len],
+			buf->len - aborted_len, SYS_FOREVER_MS);
+
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void uart_work_handler(struct k_work *item)
+{
+	struct uart_data_t *buf;
+
+	buf = k_malloc(sizeof(*buf));
+	if (buf) {
+		buf->len = 0;
+	} else {
+		LOG_WRN("Not able to allocate UART receive buffer");
+		k_work_reschedule(&uart_work, UART_WAIT_FOR_BUF_DELAY);
+		return;
+	}
+
+	uart_rx_enable(uart, buf->data, sizeof(buf->data), UART_WAIT_FOR_RX);
+}
+
+static bool uart_test_async_api(const struct device *dev)
+{
+	const struct uart_driver_api *api =
+			(const struct uart_driver_api *)dev->api;
+
+	return (api->callback_set != NULL);
+}
+
+static int uart_init(void)
+{
+	int err;
+	int pos;
+	struct uart_data_t *rx;
+	struct uart_data_t *tx;
+
+	if (!device_is_ready(uart)) {
+		return -ENODEV;
+	}
+
+	rx = k_malloc(sizeof(*rx));
+	if (rx) {
+		rx->len = 0;
+	} else {
+		return -ENOMEM;
+	}
+
+	k_work_init_delayable(&uart_work, uart_work_handler);
+
+	if (IS_ENABLED(CONFIG_UART_ASYNC_ADAPTER) && !uart_test_async_api(uart)) {
+		/* Implement API adapter */
+		uart_async_adapter_init(async_adapter, uart);
+		uart = async_adapter;
+	}
+
+	err = uart_callback_set(uart, uart_cb, NULL);
+	if (err) {
+		k_free(rx);
+		LOG_ERR("Cannot initialize UART callback");
+		return err;
+	}
+
+	if (IS_ENABLED(CONFIG_UART_LINE_CTRL)) {
+		LOG_INF("Wait for DTR");
+		while (true) {
+			uint32_t dtr = 0;
+
+			uart_line_ctrl_get(uart, UART_LINE_CTRL_DTR, &dtr);
+			if (dtr) {
+				break;
+			}
+			/* Give CPU resources to low priority threads. */
+			k_sleep(K_MSEC(100));
+		}
+		LOG_INF("DTR set");
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DCD, 1);
+		if (err) {
+			LOG_WRN("Failed to set DCD, ret code %d", err);
+		}
+		err = uart_line_ctrl_set(uart, UART_LINE_CTRL_DSR, 1);
+		if (err) {
+			LOG_WRN("Failed to set DSR, ret code %d", err);
+		}
+	}
+
+	tx = k_malloc(sizeof(*tx));
+
+	if (tx) {
+		pos = snprintf(tx->data, sizeof(tx->data),
+			       "Starting NUS & IPC monitor\r\n");
+
+		if ((pos < 0) || (pos >= sizeof(tx->data))) {
+			k_free(rx);
+			k_free(tx);
+			LOG_ERR("snprintf returned %d", pos);
+			return -ENOMEM;
+		}
+
+		tx->len = pos;
+	} else {
+		k_free(rx);
+		return -ENOMEM;
+	}
+
+	err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+	if (err) {
+		k_free(rx);
+		k_free(tx);
+		LOG_ERR("Cannot display welcome message (err: %d)", err);
+		return err;
+	}
+
+	err = uart_rx_enable(uart, rx->data, sizeof(rx->data), UART_WAIT_FOR_RX);
+	if (err) {
+		LOG_ERR("Cannot enable uart reception (err: %d)", err);
+		/* Free the rx buffer only because the tx buffer will be handled in the callback */
+		k_free(rx);
+	}
+
+	return err;
+}
+
+static void adv_work_handler(struct k_work *work)
+{
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	if (err) {
+		LOG_ERR("Advertising failed to start (err %d)", err);
+		return;
+	}
+
+	LOG_INF("Advertising successfully started");
+}
+
+static void advertising_start(void)
+{
+	k_work_submit(&adv_work);
+}
+
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (err) {
+		LOG_ERR("Connection failed, err 0x%02x %s", err, bt_hci_err_to_str(err));
+		return;
+	}
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("Connected %s", addr);
+
+	current_conn = bt_conn_ref(conn);
+
+	gpio_pin_set_dt(&con_led, 1);
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Disconnected: %s, reason 0x%02x %s", addr, reason, bt_hci_err_to_str(reason));
+
+	if (auth_conn) {
+		bt_conn_unref(auth_conn);
+		auth_conn = NULL;
+	}
+
+	if (current_conn) {
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+		gpio_pin_set_dt(&con_led, 0);
+	}
+}
+
+static void recycled_cb(void)
+{
+	LOG_INF("Connection object available from previous conn. Disconnect is complete!");
+	advertising_start();
+}
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (!err) {
+		LOG_INF("Security changed: %s level %u", addr, level);
+	} else {
+		LOG_WRN("Security failed: %s level %u err %d %s", addr, level, err,
+			bt_security_err_to_str(err));
+	}
+}
+#endif
+
+BT_CONN_CB_DEFINE(conn_callbacks) = {
+	.connected        = connected,
+	.disconnected     = disconnected,
+	.recycled         = recycled_cb,
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	.security_changed = security_changed,
+#endif
+};
+
+#if defined(CONFIG_BT_NUS_SECURITY_ENABLED)
+static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+}
+
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	auth_conn = bt_conn_ref(conn);
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Passkey for %s: %06u", addr, passkey);
+
+	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF54HX) || IS_ENABLED(CONFIG_SOC_SERIES_NRF54LX)) {
+		LOG_INF("Press Button 0 to confirm, Button 1 to reject.");
+	} else {
+		LOG_INF("Press Button 1 to confirm, Button 2 to reject.");
+	}
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing cancelled: %s", addr);
+}
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing completed: %s, bonded: %d", addr, bonded);
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	LOG_INF("Pairing failed conn: %s, reason %d %s", addr, reason,
+		bt_security_err_to_str(reason));
+}
+
+static struct bt_conn_auth_cb conn_auth_callbacks = {
+	.passkey_display = auth_passkey_display,
+	.passkey_confirm = auth_passkey_confirm,
+	.cancel = auth_cancel,
+};
+
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed
+};
+#else
+static struct bt_conn_auth_cb conn_auth_callbacks;
+static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
+#endif
+
+static void bt_receive_cb(struct bt_conn *conn, const uint8_t *const data,
+			  uint16_t len)
+{
+	int err;
+	char addr[BT_ADDR_LE_STR_LEN] = {0};
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, ARRAY_SIZE(addr));
+
+	LOG_INF("Received data from: %s", addr);
+
+	for (uint16_t pos = 0; pos != len;) {
+		struct uart_data_t *tx = k_malloc(sizeof(*tx));
+
+		if (!tx) {
+			LOG_WRN("Not able to allocate UART send data buffer");
+			return;
+		}
+
+		/* Keep the last byte of TX buffer for potential LF char. */
+		size_t tx_data_size = sizeof(tx->data) - 1;
+
+		if ((len - pos) > tx_data_size) {
+			tx->len = tx_data_size;
+		} else {
+			tx->len = (len - pos);
+		}
+
+		memcpy(tx->data, &data[pos], tx->len);
+
+		pos += tx->len;
+
+		/* Append the LF character when the CR character triggered
+		 * transmission from the peer.
+		 */
+		if ((pos == len) && (data[len - 1] == '\r')) {
+			tx->data[tx->len] = '\n';
+			tx->len++;
+		}
+
+		err = uart_tx(uart, tx->data, tx->len, SYS_FOREVER_MS);
+		if (err) {
+			k_fifo_put(&fifo_uart_tx_data, tx);
+		}
+	}
+}
+
+static struct bt_nus_cb nus_cb = {
+	.received = bt_receive_cb,
+};
+
+void error(void)
+{
+	gpio_pin_set_dt(&run_led, 1);
+	gpio_pin_set_dt(&con_led, 1);
+
+	while (true) {
+		/* Spin for ever */
+		k_sleep(K_MSEC(1000));
+	}
+}
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+static void num_comp_reply(bool accept)
+{
+	if (accept) {
+		bt_conn_auth_passkey_confirm(auth_conn);
+		LOG_INF("Numeric Match, conn %p", (void *)auth_conn);
+	} else {
+		bt_conn_auth_cancel(auth_conn);
+		LOG_INF("Numeric Reject, conn %p", (void *)auth_conn);
+	}
+
+	bt_conn_unref(auth_conn);
+	auth_conn = NULL;
+}
+
+void button_changed(uint32_t button_state, uint32_t has_changed)
+{
+	uint32_t buttons = button_state & has_changed;
+
+	if (auth_conn) {
+		if (buttons & KEY_PASSKEY_ACCEPT) {
+			num_comp_reply(true);
+		}
+
+		if (buttons & KEY_PASSKEY_REJECT) {
+			num_comp_reply(false);
+		}
+	}
+}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+
+static void configure_gpio(void)
+{
+	int err;
+
+#ifdef CONFIG_BT_NUS_SECURITY_ENABLED
+	err = dk_buttons_init(button_changed);
+	if (err) {
+		LOG_ERR("Cannot init buttons (err: %d)", err);
+	}
+#endif /* CONFIG_BT_NUS_SECURITY_ENABLED */
+
+	if (!gpio_is_ready_dt(&run_led)) {
+		LOG_ERR("Run LED GPIO device not ready");
+		error();
+	}
+
+	if (!gpio_is_ready_dt(&con_led)) {
+		LOG_ERR("Connection LED GPIO device not ready");
+		error();
+	}
+
+	err = gpio_pin_configure_dt(&run_led, GPIO_OUTPUT_INACTIVE);
+	if (err < 0) {
+		LOG_ERR("Failed to configure Run LED");
+		error();
+	}
+
+	err = gpio_pin_configure_dt(&con_led, GPIO_OUTPUT_INACTIVE);
+	if (err < 0) {
+		LOG_ERR("Failed to configure Connection LED");
+		error();
+	}
+}
+
+int main(void)
+{
+	int blink_status = 0;
+	int err = 0;
+	const struct device *ipc0_instance;
+	struct ipc_ept ep;
+
+	configure_gpio();
+
+	err = uart_init();
+	if (err) {
+		error();
+	}
+
+	if (IS_ENABLED(CONFIG_BT_NUS_SECURITY_ENABLED)) {
+		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+		if (err) {
+			LOG_ERR("Failed to register authorization callbacks. (err: %d)", err);
+			return 0;
+		}
+
+		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+		if (err) {
+			LOG_ERR("Failed to register authorization info callbacks. (err: %d)", err);
+			return 0;
+		}
+	}
+
+	err = bt_enable(NULL);
+	if (err) {
+		error();
+	}
+
+	LOG_INF("Bluetooth initialized");
+
+	k_sem_give(&ble_init_ok);
+
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
+	}
+
+	err = bt_nus_init(&nus_cb);
+	if (err) {
+		LOG_ERR("Failed to initialize UART service (err: %d)", err);
+		return 0;
+	}
+
+	k_work_init(&adv_work, adv_work_handler);
+	advertising_start();
+
+	/* IPC Service setup */
+	LOG_INF("Initializing IPC service to monitor RISC-V LED status...");
+	ipc0_instance = DEVICE_DT_GET(DT_NODELABEL(ipc0));
+
+	err = ipc_service_open_instance(ipc0_instance);
+	if ((err < 0) && (err != -EALREADY)) {
+		LOG_ERR("ipc_service_open_instance() failure");
+		return err;
+	}
+
+	err = ipc_service_register_endpoint(ipc0_instance, &ep, &ep_cfg);
+	if (err < 0) {
+		LOG_ERR("ipc_service_register_endpoint() failure");
+		return err;
+	}
+
+#if defined(CONFIG_MULTITHREADING)
+	k_sem_take(&bound_sem, K_FOREVER);
+#else
+	while (bound_sem != 0) {
+	};
+#endif
+
+	LOG_INF("IPC bound. BLE UART and RISC-V LED Monitor are running!");
+
+	for (;;) {
+		gpio_pin_toggle_dt(&run_led);
+		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
+	}
+}
+
+void ble_write_thread(void)
+{
+	/* Don't go any further until BLE is initialized */
+	k_sem_take(&ble_init_ok, K_FOREVER);
+	struct uart_data_t nus_data = {
+		.len = 0,
+	};
+
+	for (;;) {
+		/* Wait indefinitely for data to be sent over bluetooth */
+		struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data,
+						     K_FOREVER);
+
+		int plen = MIN(sizeof(nus_data.data) - nus_data.len, buf->len);
+		int loc = 0;
+
+		while (plen > 0) {
+			memcpy(&nus_data.data[nus_data.len], &buf->data[loc], plen);
+			nus_data.len += plen;
+			loc += plen;
+
+			if (nus_data.len >= sizeof(nus_data.data) ||
+			   (nus_data.data[nus_data.len - 1] == '\n') ||
+			   (nus_data.data[nus_data.len - 1] == '\r')) {
+				if (bt_nus_send(NULL, nus_data.data, nus_data.len)) {
+					LOG_WRN("Failed to send data over BLE connection");
+				}
+				nus_data.len = 0;
+			}
+
+			plen = MIN(sizeof(nus_data.data), buf->len - loc);
+		}
+
+		k_free(buf);
+	}
+}
+
+K_THREAD_DEFINE(ble_write_thread_id, STACKSIZE, ble_write_thread, NULL, NULL,
+		NULL, PRIORITY, 0, 0);

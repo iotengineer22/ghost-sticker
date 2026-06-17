@@ -64,10 +64,3 @@ For more details and the full text of both licenses, please refer to the **[LICE
 
 ---
 
-## Clean Up Notes
-
-The workspace has been prepared for GitHub:
-* All projects have been organized under the `src/` directory.
-* All temporary execution scripts (`reconstruct.py`, `extract_final_yesterday.py`) have been removed.
-* Older source backups (`yesterday_host_main.c`, etc.) have been deleted.
-* All `build` directories have been deleted to keep the repository clean and ready for clean compilation.
