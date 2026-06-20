@@ -6,6 +6,10 @@ It includes single-core BLE samples, multi-core applications using IPC between t
 
 All firmware projects are located inside the `src/` directory, and the hardware design files are located inside the `board/` directory.
 
+🎥 **[Watch the Demo Video on YouTube](https://youtu.be/orQzxtM1jN4)**
+
+[![Ghost Edge AI Sticker Demo Video](https://img.youtube.com/vi/orQzxtM1jN4/0.jpg)](https://youtu.be/orQzxtM1jN4)
+
 ---
 
 ## 🛠️ Hardware Overview (Custom Board)
@@ -61,6 +65,3 @@ This repository is distributed under a **mixed licensing scheme (multi-license)*
 2. **Firmware & SDK Derived Code**: Most firmware files in the `src/` directory (derived from the nRF Connect SDK) are subject to the **Nordic 5-Clause License**, which limits execution and use strictly to Nordic Semiconductor integrated circuits.
 
 For more details and the full text of both licenses, please refer to the **[LICENSE](./LICENSE)** file.
-
----
-
