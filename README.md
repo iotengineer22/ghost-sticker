@@ -37,6 +37,12 @@ The `board/` directory contains all files required to view, modify, or manufactu
   * `bare_pcb_top.jpg` - Unpopulated bare PCB (Top side).
   * `fpc_panel_sheet.jpg` - Manufactured FPC panels on a sheet.
 
+### ⚠️ Hardware Feedback (Lessons Learned)
+
+During the hardware testing phase, we identified a footprint issue on the PCB/FPC artwork regarding the PDM microphone:
+* **Footprint Orientation Error**: The PDM microphone component footprint was designed with a **180-degree rotation error** (placed backward) on the board. Because of this footprint mistake, we were unable to debug or confirm the operation of the audio features on the actual physical hardware.
+* **Important Design Note**: Although we have added warning notes to the uploaded schematic PDF and PCB layout artwork, anyone attempting to manufacture this board should **carefully review the component datasheets** and verify the footprint pins before starting production.
+
 ---
 
 ## Project List
@@ -51,7 +57,7 @@ Here is an overview of the projects available in this repository:
 | [peripheral_uart_i2c](./src/peripheral_uart_i2c/README.md) | Single (ARM) | Streams raw LSM6DSO accelerometer data via I2C at 104Hz, packed and sent over BLE (NUS). |
 | [peripheral_uart_i2c_demo](./src/peripheral_uart_i2c_demo/README.md) | Single (ARM) | Demo version of `peripheral_uart_i2c` that limits BLE transmission rate to 1Hz. |
 | [peripheral_uart_i2c_edge](./src/peripheral_uart_i2c_edge/README.md) | Single (ARM) | Performs real-time Edge AI gesture inference on LSM6DSO data using Edge Impulse, streaming results over BLE. |
-| [peripheral_uart_pdm](./src/peripheral_uart_pdm/README.md) | Single (ARM) | Runs real-time Edge AI audio inference using a PDM Microphone (*Note: Unconfirmed/Pin Conflict exists*). |
+| [peripheral_uart_pdm](./src/peripheral_uart_pdm/README.md) | Single (ARM) | Runs real-time Edge AI audio inference using a PDM Microphone (*Note: Unconfirmed due to microphone footprint issue*). |
 | [riscv_gpio](./src/riscv_gpio/README.md) | Dual (ARM+RISC-V) | RISC-V core controls alternating LEDs and sends status updates to ARM core via IPC (icmsg), which forwards them over BLE. |
 | [riscv_uart](./src/riscv_uart/README.md) | Dual (ARM+RISC-V) | RISC-V core reads LSM6DSO accelerometer data via I2C and sends it to ARM core via IPC, which forwards it over BLE. |
 
@@ -65,3 +71,13 @@ This repository is distributed under a **mixed licensing scheme (multi-license)*
 2. **Firmware & SDK Derived Code**: Most firmware files in the `src/` directory (derived from the nRF Connect SDK) are subject to the **Nordic 5-Clause License**, which limits execution and use strictly to Nordic Semiconductor integrated circuits.
 
 For more details and the full text of both licenses, please refer to the **[LICENSE](./LICENSE)** file.
+
+---
+
+## Clean Up Notes
+
+The workspace has been prepared for GitHub:
+* All projects have been organized under the `src/` directory.
+* All temporary execution scripts (`reconstruct.py`, `extract_final_yesterday.py`) have been removed.
+* Older source backups (`yesterday_host_main.c`, etc.) have been deleted.
+* All `build` directories have been deleted to keep the repository clean and ready for clean compilation.
